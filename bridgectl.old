@@ -1,0 +1,181 @@
+#!/bin/sh
+# Start/stop the bridging daemon.
+#
+### BEGIN INIT INFO
+# Provides:          bridging
+# Required-Start:    $syslog $time
+# Required-Stop:     $syslog $time
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Bridge External to Internal, filtering non-MGCP traffic
+# Description:       This appliance is built to filter only MGCP traffic
+#                       between the external and internal interfaces.
+### END INIT INFO
+
+backplane()
+{
+    if [ "$1" = start ];
+    then
+        LinkAdmin -c 1 -a 1
+        LinkAdmin -c 2 -a 1
+        sleep 1
+        LinkAdmin -c 1 -a 2
+        LinkAdmin -c 2 -a 2
+        ifconfig eth0 0.0.0.0 up
+        ifconfig eth1 0.0.0.0 up
+        sleep 1
+        BackplaneAdmin -v
+        BackplaneAdmin -W
+        BackplaneAdmin -l
+    else
+        BackplaneAdmin -L
+        BackplaneAdmin -w
+        BackplaneAdmin -r
+    fi
+}
+
+ebtable()
+{
+    if [ "$1" = start ];
+    then
+        ebtable stop  # Yay, recursion!
+
+        ebtables -P FORWARD DROP
+#       ebtables -A FORWARD -p 0x806 -j ACCEPT         # ARP
+        ebtables -A FORWARD -p 0x800 --ip-proto udp --ip-dport 2427  -j ACCEPT      # MGCP/Gateway
+        ebtables -A FORWARD -p 0x800 --ip-proto udp --ip-dport 2727  -j ACCEPT      # MGCP/CallAgent
+# Fixup the 'dest' mac addresses of the MTA's, because they're not forwarded otherwise.
+# Since we don't care about the dest mac address anyway (it'd be the default routers')
+# we pick something that's not likely to show up.
+        ebtables -t nat -F NONLOCAL >/dev/null 2>&1
+        ebtables -t nat -X NONLOCAL >/dev/null 2>&1
+        ebtables -t nat -N NONLOCAL
+        ebtables -t nat -A PREROUTING -i eth0 -p ! 0x800 -j ACCEPT
+        ebtables -t nat -A PREROUTING -i eth0  -p 0x800 --ip-dst 10.0.0.0/8  -j NONLOCAL
+        ebtables -t nat -A NONLOCAL -i eth0 -p 0x800 -j dnat --to-dst de:ad:be:ef:ca:fe --dnat-target ACCEPT
+
+    elif [ "$1" = transparant ];
+    then
+        ebtable stop  # Yay, recursion!
+
+        ebtables -P FORWARD DROP
+#       ebtables -A FORWARD -p 0x806 -j ACCEPT         # ARP
+        ebtables -A FORWARD -p 0x800 -j ACCEPT      # Any IP traffic....
+# Fixup the 'dest' mac addresses of the MTA's, because they're not forwarded otherwise.
+# Since we don't care about the dest mac address anyway (it'd be the default routers')
+# we pick something that's not likely to show up.
+        ebtables -t nat -F NONLOCAL >/dev/null 2>&1
+        ebtables -t nat -X NONLOCAL >/dev/null 2>&1
+        ebtables -t nat -N NONLOCAL
+        ebtables -t nat -A PREROUTING -i eth0 -p ! 0x800 -j ACCEPT
+        ebtables -t nat -A PREROUTING -i eth0  -p 0x800 --ip-dst 10.0.0.0/8  -j NONLOCAL
+        ebtables -t nat -A NONLOCAL -i eth0 -p 0x800 -j dnat --to-dst de:ad:be:ef:ca:fe --dnat-target ACCEPT
+
+    else
+        for TABLE in filter nat broute;
+        do
+            ebtables -t ${TABLE} -F  >/dev/null 2>&1
+            ebtables -t ${TABLE} -X  >/dev/null 2>&1
+        done
+    fi
+}
+
+bridge()
+{
+    if [ "$1" = start ];
+    then
+        brctl addbr br0
+        brctl stp br0 off
+        ifconfig eth0 down
+        ifconfig eth1 down
+        ip link set arp off dev eth0
+        ip link set arp off dev eth1
+        ifconfig eth0 0.0.0.0 up
+        ifconfig eth1 0.0.0.0 up
+        brctl addif br0 eth0
+        brctl addif br0 eth1
+        ifconfig br0 0.0.0.0 up
+    else
+        ifconfig br0 down  >/dev/null 2>&1
+        brctl delif br0 eth1  >/dev/null 2>&1
+        brctl delif br0 eth0  >/dev/null 2>&1
+        brctl delbr br0  >/dev/null 2>&1
+        ifconfig eth0 down >/dev/null 2>&1
+        ifconfig eth1 down >/dev/null 2>&1
+    fi
+}
+
+modules()
+{
+        for i in bridge ebtables ebt_ip ebt_802_3 ebtable_broute ebtable_filter
+        do
+                modprobe $i  >/dev/null 2>&1
+        done
+}
+
+status()
+{
+        echo "Checking status..."
+        backplane=$(BackplaneAdmin -c 2>&1 | grep "Internal LED" | awk '{print $4}')
+        echo "Backplane is ${backplane}"
+        eth0=$(ifconfig eth0 2>&1 | grep Metric | grep UP | awk '{print $1}')
+        echo "eth0 is ${eth0:-DOWN}"
+        eth1=$(ifconfig eth1 2>&1 | grep Metric | grep UP | awk '{print $1}')
+        echo "eth1 is ${eth1:-DOWN}"
+        br0=$(ifconfig br0 2>&1 | grep Metric | grep UP | awk '{print $1}')
+        echo "br0 is ${br0:-DOWN}"
+        ebtables=$(ebtables -t filter -L | grep -vE "^Bridge|^\$")
+        ebt="UP"
+        if [ -z "${ebtables}" ];
+        then
+           ebt="DOWN"
+        fi
+        echo "ebtables is ${ebt}"
+}
+
+
+test -f /usr/local/SWG/bin/LinkAdmin || exit 0
+test -f /usr/local/SWG/bin/BackplaneAdmin || exit 0
+test -f /sbin/ebtables || exit 0
+
+PATH=/usr/local/SWG/bin:${PATH}
+
+. /lib/lsb/init-functions
+
+case "$1" in
+start)  modules
+        bridge start
+        backplane start
+        ebtable start
+
+        ;;
+stop)   ebtable stop
+        backplane stop
+        bridge stop
+        ;;
+restart|reload|force-reload) backplane start
+        ;;
+backplane-start) backplane start
+        ;;
+backplane-stop) backplane stop
+        ;;
+ebtable-start) ebtable start
+        ;;
+ebtable-stop) ebtable stop
+        ;;
+ebtable-transparant) ebtable transparant
+        ;;
+bridge-start) bridge start
+        ;;
+bridge-stop) bridge stop
+        ;;
+status) status
+        ;;
+*)      log_action_msg "Usage: /etc/init.d/bridgectl {start|stop|restart|reload|force-reload|status|([backplane|ebtable|bridge]-[sta
+rt|stop])}"
+        exit 2
+        ;;
+esac
+exit 0
+
+##########################

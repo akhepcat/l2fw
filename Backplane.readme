@@ -1,0 +1,6 @@
+BackplaneAdmin and LinkAdmin are legacy controls for an older ethernet board
+that allowed for pass-through on failure.
+not needed for 99.9999% of operations
+
+Since they're only for really-old 32-bit  linux systems, they'll probably not work
+anywhere else

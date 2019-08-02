@@ -1,0 +1,61 @@
+#!/bin/bash
+
+PATH=/bin:/usr/bin:/usr/local/bin/
+
+for device in `find -L /sys/class/net/ -maxdepth 3 -name carrier 2>/dev/null | sort | grep -i eth`
+do
+  # device = /sys/class/net/eth0/carrier
+  #
+  # enabled == /sys/class/net/eth0/operstate==1?yes:no
+  # link  == $enabled && /sys/class/net/eth0/carrier==1?yes:no
+
+  mydev=$( dirname ${device} | cut -f 5 -d/ )
+
+  type=$(cat /sys/class/net/${mydev}/type)
+  if [ ${type} -eq 1 ];
+  then
+    flags=$( cat /sys/class/net/${mydev}/flags | cut -f 2 -dx | rev | cut -b 1 )
+    if [ ${flags} -ge 2 ];
+    then
+         flags=$((flags - 2))
+    fi
+
+    if [ ${flags} -eq 1 ];
+    then
+        link=$(cat ${device} )
+
+        if [ ${link} -eq 1 ];
+        then
+            if [ "${mydev}" = "eth0" ];
+            then
+                 BackplaneAdmin -I
+            elif [ "${mydev}" = "eth1" ];
+            then
+                 BackplaneAdmin -E
+            fi
+        else
+            if [ "${mydev}" = "eth0" ];
+            then
+                 BackplaneAdmin -i
+            elif [ "${mydev}" = "eth1" ];
+            then
+                 BackplaneAdmin -e
+            fi
+        fi
+    else
+        echo "disabled"
+    fi
+
+  elif [ ${type} -eq 772 ];
+  then
+      #oper=$(cat /sys/class/net/${mydev}/operstate)
+      #if [ ${oper} = "up" -o ${oper} = "unknown" ];
+      link=$(cat /sys/class/net/${mydev}/carrier)
+      if [ ${link} -eq 1 ];
+      then
+         echo "${mydev} is enabled"
+      else
+         echo "${mydev} is not enabled"
+      fi
+  fi
+done

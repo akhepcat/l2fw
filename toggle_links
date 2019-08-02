@@ -1,0 +1,11 @@
+#! /bin/bash
+
+PATH=/usr/local/SWG/bin:${PATH}
+LinkAdmin -c 1 -a 1
+LinkAdmin -c 2 -a 1
+BackplaneAdmin -v
+sleep 1
+LinkAdmin -c 1 -a 2
+LinkAdmin -c 2 -a 2
+BackplaneAdmin -T
+BackplaneAdmin -L

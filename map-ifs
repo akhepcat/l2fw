@@ -1,0 +1,84 @@
+#!/bin/bash
+# map the ethernet ports.
+#
+### BEGIN INIT INFO
+# Provides:          map-ifs
+# Required-Start:    $syslog $time $ethmap
+# Required-Stop:     $syslog $time
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Author: Leif Sawyer <lsawyer@gci.com>
+# Short-Description: remaps ethernet interfaces by order of mac address
+# Description:       This is the program which outputs remapped ethernet interface names for use in udev rules.
+#                      It is called by ethmap, and isn't really isn't an rc.d/init.d prgram but the header
+#                      is just an easy consistent method of providing limited documentation.
+### END INIT INFO
+
+declare -a ETHS
+declare -a IFACES
+
+IFACES=( `ip link | grep "eth[0-9]" | awk '{print $2}' | sed 's/://g' | sort -u ` )
+ETHS=( `ip link | grep -A 1 "eth[0-9]" | awk '{print $2}' | grep -v "eth[0-9]" | sort -u` )
+
+
+cnt=${#IFACES[*]}
+
+for (( i = 0 ; i < cnt ; i++ ))
+do
+   tmp=$(ip link | grep -A 1 "eth$i" | grep -v "eth$i" | awk '{print $2}' )
+   if [ -z "$tmp" ];
+   then
+      break
+   fi
+
+   iface[$i]=$tmp
+
+#   echo -n "iface [$i]: eth$i = "
+#   echo ${iface[$i]}
+done
+
+cnt=${#ETHS[*]}
+
+for (( i = 0 ; i < cnt ; i++ ))
+do
+   myeth=${ETHS[$i]}
+   tmp=$(ip link | grep -B 1 "$myeth" | grep -v "$myeth" | awk '{print $2}' | sed 's/://g' )
+   if [ -z "$tmp" ];
+   then
+      break
+   fi
+
+   ifnum=$(echo $tmp | sed 's/eth//g')
+   iface_by_eth[$i]=$myeth
+
+#   echo "iface [$i]: $myeth = eth${ifnum}"
+done
+
+REBUILD=0
+for (( i = 0 ; i < cnt ; i++ ))
+do
+  if [ "${iface_by_eth[$i]}" != "${iface[$i]}" ]
+  then
+     REBUILD=1
+  fi
+done
+
+if [ $REBUILD -eq 0 ]
+then
+	for (( i = 0 ; i < cnt ; i++ ))
+	do
+	  if [ -z "$( grep ${iface_by_eth[$i]} /etc/udev/rules.d/70-persistent-net.rules )" ]
+	  then
+	     REBUILD=1
+	  fi
+	done
+fi
+
+if [ $REBUILD -eq 1 ];
+then
+   for (( i = 0 ; i < cnt ; i++ ))
+   do
+      echo "SUBSYSTEM==\"net\", ATTRS{address}==\"${iface_by_eth[$i]}\", ATTR{type}==\"1\", NAME=\"eth${i}\""
+   done
+fi
+

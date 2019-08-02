@@ -1,0 +1,229 @@
+#!/bin/bash
+# Start/stop the bridging daemon.
+#
+### BEGIN INIT INFO
+# Provides:          bridging
+# Required-Start:    $syslog $time
+# Required-Stop:     $syslog $time
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Author: Leif Sawyer <lsawyer@gci.com>
+# Short-Description: Bridge External to Internal, filtering non-MGCP traffic
+# Description:       This appliance is built to filter only MGCP traffic
+#                       between the external and internal interfaces.
+### END INIT INFO
+
+IN_PHYS="eth0"
+OUT_PHYS="eth1"
+#IN_LOG="vlan1"
+
+
+backplane()
+{
+    if [ "$1" = start ];
+    then
+        LinkAdmin -c 1 -a 1
+        LinkAdmin -c 2 -a 1
+        sleep 1
+        LinkAdmin -c 1 -a 2
+        LinkAdmin -c 2 -a 2
+        ifconfig ${IN_PHYS} 0.0.0.0 up
+        ifconfig ${OUT_PHYS} 0.0.0.0 up
+        sleep 1
+        BackplaneAdmin -v
+        BackplaneAdmin -W
+        BackplaneAdmin -l
+    else
+        BackplaneAdmin -L
+        BackplaneAdmin -w
+        BackplaneAdmin -r
+    fi
+}
+
+ebtable()
+{
+    if [ "$1" = "start" -o  "$1" = "transparant" ];
+    then
+        ebtable stop  # Yay, recursion!
+
+        if  [ "$1" = "start" ];
+        then
+                ebtables -P FORWARD DROP
+        #       ebtables -A FORWARD -p 0x806 -j ACCEPT         # ARP
+                ebtables -A FORWARD -p 0x800 --ip-proto udp --ip-dport 2427  -j ACCEPT      # MGCP/Gateway
+                ebtables -A FORWARD -p 0x800 --ip-proto udp --ip-dport 2727  -j ACCEPT      # MGCP/CallAgent
+                ebtables -A FORWARD -p 0x800 --ip-proto udp --ip-dport 5060  -j ACCEPT      # SIP
+        else
+                ebtables -P FORWARD DROP
+        #       ebtables -A FORWARD -p 0x806 -j ACCEPT         # ARP
+                ebtables -A FORWARD -p 0x800 -j ACCEPT      # Any IP traffic....
+        fi
+# Fixup the 'dest' mac addresses of the MTA's, because they're not forwarded otherwise.
+# Since we don't care about the dest mac address anyway (it'd be the default routers')
+# we pick something that's not likely to show up.
+        for TABLE in NONLOCAL10 NONLOCAL24
+        do
+                ebtables -t nat -F ${TABLE} >/dev/null 2>&1
+                ebtables -t nat -X ${TABLE} >/dev/null 2>&1
+                ebtables -t nat -N ${TABLE}
+        done
+
+# for MGCP, we're capturing  src=10 vs dst=24  (or opposite)
+# for SIP, it's more complicated:
+# ( net 10.195.0.0/16 and net 192.0.2.0/24 ) or ( net 10.194.0.0/20 and net 10.194.255.0/24 )
+#
+        ebtables -t nat -A PREROUTING -i ${IN_LOG:-$IN_PHYS} -p ! 0x800 -j DROP
+
+        ebtables -t nat -A PREROUTING -i ${IN_LOG:-$IN_PHYS} -p 0x800 --ip-dst 192.0.2.0/27 -j NONLOCAL10
+        ebtables -t nat -A PREROUTING -i ${IN_LOG:-$IN_PHYS} -p 0x800 --ip-dst 192.168.75.0/27 -j NONLOCAL10
+        ebtables -t nat -A PREROUTING -i ${IN_LOG:-$IN_PHYS} -p 0x800 --ip-dst 10.0.0.0/8 -j NONLOCAL10
+#
+        ebtables -t nat -A PREROUTING -i ${IN_LOG:-$IN_PHYS} -p 0x800 --ip-src 192.0.2.0/27 -j NONLOCAL24
+        ebtables -t nat -A PREROUTING -i ${IN_LOG:-$IN_PHYS} -p 0x800 --ip-src 192.168.75.0/27 -j NONLOCAL24
+        ebtables -t nat -A PREROUTING -i ${IN_LOG:-$IN_PHYS} -p 0x800 --ip-src 10.0.0.0/8 -j NONLOCAL24
+#
+        ebtables -t nat -A NONLOCAL10 -i ${IN_LOG:-$IN_PHYS} -p 0x800 -j dnat --to-dst ${PHY10} --dnat-target ACCEPT
+        ebtables -t nat -A NONLOCAL24 -i ${IN_LOG:-$IN_PHYS} -p 0x800 -j dnat --to-dst ${PHY24} --dnat-target ACCEPT
+
+    else
+        for TABLE in filter nat broute;
+        do
+            ebtables -t ${TABLE} --init-table  >/dev/null 2>&1
+            #ebtables -t ${TABLE} -F  >/dev/null 2>&1
+            #ebtables -t ${TABLE} -X  >/dev/null 2>&1
+            #ebtables -P FORWARD ACCEPT
+        done
+    fi
+}
+
+bridge()
+{
+    if [ "$1" = start ];
+    then
+        brctl addbr br0
+        brctl stp br0 off
+        ifconfig ${IN_LOG:-$IN_PHYS} down
+        ifconfig ${OUT_PHYS} down
+        ip link set arp off dev ${IN_LOG:-$IN_PHYS}
+        ip link set arp off dev ${OUT_PHYS}
+        ifconfig ${IN_LOG:-$IN_PHYS} 0.0.0.0 up
+        ifconfig ${OUT_PHYS} 0.0.0.0 up
+        brctl addif br0 ${IN_LOG:-$IN_PHYS}
+        brctl addif br0 ${OUT_PHYS}
+        ifconfig br0 0.0.0.0 up
+    else
+        ifconfig br0 down  >/dev/null 2>&1
+        brctl delif br0 ${IN_LOG:-$IN_PHYS}  >/dev/null 2>&1
+        brctl delif br0 ${OUT_PHYS}  >/dev/null 2>&1
+        brctl delbr br0  >/dev/null 2>&1
+        ifconfig ${IN_LOG:-$IN_PHYS} down >/dev/null 2>&1
+        ifconfig ${OUT_PHYS} down >/dev/null 2>&1
+    fi
+}
+
+vlan()
+{
+    if [ "$1" = start -a -n "${IN_LOG}" ];
+    then
+	VLAN="${IN_LOG##*vlan}"
+	vconfig set_name_type VLAN_PLUS_VID_NO_PAD >/dev/null 2>&1
+	vconfig add ${IN_PHYS} ${VLAN} >/dev/null 2>&1
+	ip link set ${IN_LOG}_rename name ${IN_LOG} >/dev/null 2>&1
+        ifconfig ${IN_LOG} 0.0.0.0 up
+    elif [ "$1" = stop ];
+    then
+	ifconfig ${IN_LOG} down >/dev/null 2>&1
+	vconfig rem ${IN_LOG} >/dev/null 2>&1
+    fi
+}
+
+modules()
+{
+        for i in bridge ebtables ebt_ip ebt_802_3 ebtable_broute ebtable_filter 8021q
+        do
+                modprobe $i  >/dev/null 2>&1
+        done
+}
+status()
+{
+        echo "Checking status..."
+        backplane=$(BackplaneAdmin -c 2>&1 | grep "Internal LED" | awk '{print $4}')
+        echo "Backplane is ${backplane}"
+        eth0=$(ifconfig ${IN_PHYS} 2>&1 | grep Metric | grep UP | awk '{print $1}')
+        echo "IN_PHYS is ${eth0:-DOWN}"
+
+	if [ -n "${IN_LOG}" ];
+	then
+        	vlan=$(ifconfig ${IN_LOG} 2>&1 | grep Metric | grep UP | awk '{print $1}')
+        	echo "IN_LOG is ${vlan:-DOWN}"
+	fi
+        eth1=$(ifconfig ${OUT_PHYS} 2>&1 | grep Metric | grep UP | awk '{print $1}')
+        echo "OUT_PHYS is ${eth1:-DOWN}"
+
+        br0=$(ifconfig br0 2>&1 | grep Metric | grep UP | awk '{print $1}')
+        echo "br0 is ${br0:-DOWN}"
+        ebtables=$(ebtables -t filter -L | grep -vE "^Bridge|^\$")
+        ebt="UP"
+        if [ -z "${ebtables}" ];
+        then
+           ebt="DOWN"
+        fi
+        echo "ebtables is ${ebt}"
+}
+
+
+test -f /usr/local/SWG/bin/LinkAdmin || exit 0
+test -f /usr/local/SWG/bin/BackplaneAdmin || exit 0
+test -f /sbin/ebtables || exit 0
+
+PATH=/usr/local/SWG/bin:${PATH}
+
+. /lib/lsb/init-functions
+
+PHY="$(ip link show ${IN_PHYS} | grep link | awk '{print $2}' | cut -f 4- -d:)"
+PHY10="0a:0b:0c:${PHY}"
+PHY24="f0:e0:d0:${PHY}"
+
+case "$1" in
+start)  modules
+	vlan start
+        bridge start
+        backplane start
+        ebtable start
+
+        ;;
+stop)   ebtable stop
+        backplane stop
+        bridge stop
+        vlan stop
+        ;;
+restart|reload|force-reload) backplane start
+        ;;
+backplane-start) backplane start
+        ;;
+backplane-stop) backplane stop
+        ;;
+ebtable-start) ebtable start
+        ;;
+ebtable-stop) ebtable stop
+        ;;
+ebtable-transparant) ebtable transparant
+        ;;
+bridge-start) bridge start
+        ;;
+bridge-stop) bridge stop
+        ;;
+vlan-start) vlan start
+	;;
+vlan-stop) vlan stop
+	;;
+status) status
+        ;;
+*)      log_action_msg "Usage: /etc/init.d/bridgectl {start|stop|restart|reload|force-reload|status|([backplane|ebtable|bridge|vlan]-[sta
+rt|stop])}"
+        exit 2
+        ;;
+esac
+exit 0
+
+##########################
